@@ -3,6 +3,7 @@ package auth
 import (
 	"crypto/rand"
 	"database/sql"
+	"errors"
 	"time"
 
 	"github.com/atharva-navani16/chat-app.git/internal/config"
@@ -19,6 +20,7 @@ type AuthService struct {
 	config *config.Config
 }
 
+// NewAuthService creates a new auth service
 func NewAuthService(db *sql.DB, rdb *redis.Client, config *config.Config) *AuthService {
 	return &AuthService{
 		db:     db,
@@ -27,88 +29,134 @@ func NewAuthService(db *sql.DB, rdb *redis.Client, config *config.Config) *AuthS
 	}
 }
 
+// Register creates a new user account
 func (s *AuthService) Register(req *CreateUserRequest) (*AuthResponse, error) {
-	// Implement registration logic here
+	// Step 1: Hash password
 	hashedPassword, err := s.hashPassword(req.Password)
 	if err != nil {
 		return nil, err
 	}
 
+	// Step 2: Generate crypto keys
 	publicKey, signedPreKey, signature := s.generateCryptoKeys()
 
-	user, err := s.CreateUserInDB(req, hashedPassword, publicKey, signedPreKey, signature)
+	// Step 3: Save to database
+	user, err := s.createUserInDB(req, hashedPassword, publicKey, signedPreKey, signature)
 	if err != nil {
 		return nil, err
 	}
 
+	// Step 4: Generate JWT token
 	token, expiresAt, err := s.generateJWT(user.Id)
 	if err != nil {
 		return nil, err
 	}
 
+	// Step 5: Return response
 	return &AuthResponse{
 		Token:     token,
 		ExpiresAt: expiresAt,
 		User:      s.userToResponse(user),
 	}, nil
-
 }
 
+// Login authenticates a user and returns a token
+func (s *AuthService) Login(req *LoginRequest) (*AuthResponse, error) {
+	// Step 1: Find user by phone or username
+	user, err := s.findUserByCredentials(req)
+	if err != nil {
+		return nil, err
+	}
+
+	// Step 2: Check password
+	if !s.checkPassword(req.Password, user.PasswordHash) {
+		return nil, errors.New("invalid credentials")
+	}
+
+	// Step 3: Generate JWT
+	token, expiresAt, err := s.generateJWT(user.Id)
+	if err != nil {
+		return nil, err
+	}
+
+	// Step 4: Return response
+	return &AuthResponse{
+		Token:     token,
+		ExpiresAt: expiresAt,
+		User:      s.userToResponse(user),
+	}, nil
+}
+
+// hashPassword hashes a plain text password
 func (s *AuthService) hashPassword(password string) (string, error) {
-	byte, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
-	return string(byte), err
+	bytes, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	return string(bytes), err
 }
 
+// checkPassword verifies a password against its hash
 func (s *AuthService) checkPassword(password, hash string) bool {
 	err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password))
 	return err == nil
 }
 
+// generateCryptoKeys generates encryption keys for the user
 func (s *AuthService) generateCryptoKeys() ([]byte, []byte, []byte) {
 	publicKey, _, err := box.GenerateKey(rand.Reader)
 	if err != nil {
 		panic("Failed to generate crypto keys: " + err.Error())
 	}
-	signedPreKey := publicKey[:]
 
+	signedPreKey := publicKey[:]
 	signature := make([]byte, 64)
 	rand.Read(signature)
 
 	return publicKey[:], signedPreKey, signature
 }
 
-func (s *AuthService) CreateUserInDB(req *CreateUserRequest, hashedPassword string, publicKey, signedPreKey, signature []byte) (*Users, error) {
+// createUserInDB saves a new user to the database
+func (s *AuthService) createUserInDB(req *CreateUserRequest, hashedPassword string, publicKey, signedPreKey, signature []byte) (*Users, error) {
 	userId := uuid.New()
+	now := time.Now()
+
 	query := `
-    INSERT INTO users (
-        id, phone_number, username, first_name, last_name, 
-        password_hash, public_key, signed_prekey, prekey_signature,
-        is_public, allow_phone_discovery, last_seen_privacy,
-        is_online, status, created_at, updated_at
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-    RETURNING *`
-	var user Users
-	err := s.db.QueryRow(query, userId, req.PhoneNumber, req.Username, req.FirstName, req.LastName, hashedPassword, publicKey, signedPreKey, signature, true, true, "everyone", false, "active", time.Now(), time.Now()).Scan(
-		&user.Id, &user.PhoneNumber, &user.Username, &user.FirstName, &user.LastName,
-		&user.Bio, &user.ProfilePhotoID, &user.IsPublic, &user.AllowPhoneDiscovery,
-		&user.LastSeenPrivacy, &user.PasswordHash, &user.PublicKey, &user.SignedPrekey,
-		&user.PrekeySignature, &user.IsOnline, &user.LastSeen, &user.Status,
-		&user.CreatedAt, &user.UpdatedAt,
+        INSERT INTO users (
+            id, phone_number, username, first_name, last_name, 
+            password_hash, public_key, signed_prekey, prekey_signature,
+            created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`
+
+	_, err := s.db.Exec(
+		query,
+		userId, req.PhoneNumber, req.Username, req.FirstName, req.LastName,
+		hashedPassword, publicKey, signedPreKey, signature, now, now,
 	)
+
 	if err != nil {
 		return nil, err
 	}
-	return &user, nil
+
+	// Return a simple user object
+	return &Users{
+		Id:          userId,
+		PhoneNumber: req.PhoneNumber,
+		Username:    req.Username,
+		FirstName:   req.FirstName,
+		LastName:    req.LastName,
+		Bio:         "", // Default empty
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}, nil
 }
 
+// generateJWT creates a JWT token for the user
 func (s *AuthService) generateJWT(userID uuid.UUID) (string, time.Time, error) {
-	// Token expires in 24 hours (or whatever you set in config)
+	// Token expires in 24 hours
 	expiresAt := time.Now().Add(24 * time.Hour)
 
 	// Create the claims (data inside the token)
 	claims := jwt.MapClaims{
 		"user_id": userID.String(),
-		"exp":     expiresAt.Unix(),  // Expiration time
+		"exp":     expiresAt.Unix(), // Expiration time
 		"iat":     time.Now().Unix(), // Issued at time
 	}
 
@@ -124,6 +172,7 @@ func (s *AuthService) generateJWT(userID uuid.UUID) (string, time.Time, error) {
 	return tokenString, expiresAt, nil
 }
 
+// userToResponse converts internal User struct to safe UserResponse
 func (s *AuthService) userToResponse(user *Users) UserResponse {
 	return UserResponse{
 		Id:             user.Id,
@@ -134,4 +183,36 @@ func (s *AuthService) userToResponse(user *Users) UserResponse {
 		Bio:            user.Bio,
 		ProfilePhotoID: user.ProfilePhotoID,
 	}
+}
+
+// findUserByCredentials finds a user by phone number or username
+func (s *AuthService) findUserByCredentials(req *LoginRequest) (*Users, error) {
+	var query string
+	var param string
+
+	// Decide whether to search by phone or username
+	if req.PhoneNumber != "" {
+		query = "SELECT id, phone_number, username, first_name, last_name, password_hash, created_at FROM users WHERE phone_number = $1"
+		param = req.PhoneNumber
+	} else if req.Username != "" {
+		query = "SELECT id, phone_number, username, first_name, last_name, password_hash, created_at FROM users WHERE username = $1"
+		param = req.Username
+	} else {
+		return nil, errors.New("phone number or username required")
+	}
+
+	var user Users
+	err := s.db.QueryRow(query, param).Scan(
+		&user.Id, &user.PhoneNumber, &user.Username,
+		&user.FirstName, &user.LastName, &user.PasswordHash, &user.CreatedAt,
+	)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, errors.New("user not found")
+		}
+		return nil, err
+	}
+
+	return &user, nil
 }
