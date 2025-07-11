@@ -3,8 +3,10 @@ package chat
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/atharva-navani16/chat-app.git/internal/config"
@@ -16,13 +18,15 @@ type ChatService struct {
 	db     *sql.DB
 	redis  *redis.Client
 	config *config.Config
+	wsHub  *WSHub
 }
 
-func NewChatService(db *sql.DB, redis *redis.Client, config *config.Config) *ChatService {
+func NewChatService(db *sql.DB, redis *redis.Client, config *config.Config, wsHub *WSHub) *ChatService {
 	return &ChatService{
 		db:     db,
 		redis:  redis,
 		config: config,
+		wsHub:  wsHub,
 	}
 }
 
@@ -523,4 +527,398 @@ func (s *ChatService) getUnreadCount(userID uuid.UUID, chatID uuid.UUID) int {
 func (s *ChatService) updateChatTimestamp(chatID uuid.UUID) {
 	query := `UPDATE chats SET updated_at = NOW() WHERE id = $1`
 	s.db.Exec(query, chatID)
+}
+
+// Add these methods to your existing ChatService in internal/chat/service.go
+
+// AddReaction adds a reaction to a message
+func (s *ChatService) AddReaction(userID uuid.UUID, messageID uuid.UUID, chatID uuid.UUID, reactionType string) (*ReactionResponse, error) {
+	// Verify user has access to this chat
+	isMember, err := s.isUserChatMember(userID, chatID)
+	if err != nil || !isMember {
+		return nil, errors.New("access denied")
+	}
+
+	// Verify message exists in this chat
+	var msgChatID uuid.UUID
+	err = s.db.QueryRow("SELECT chat_id FROM messages WHERE id = $1", messageID).Scan(&msgChatID)
+	if err != nil {
+		return nil, errors.New("message not found")
+	}
+	if msgChatID != chatID {
+		return nil, errors.New("message not in this chat")
+	}
+
+	// Add or update reaction (upsert)
+	query := `
+		INSERT INTO message_reactions (message_id, user_id, reaction_type, created_at)
+		VALUES ($1, $2, $3, NOW())
+		ON CONFLICT (message_id, user_id, reaction_type) DO NOTHING`
+
+	_, err = s.db.Exec(query, messageID, userID, reactionType)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get updated reaction summary
+	reactionResponse, err := s.GetMessageReactions(messageID, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Broadcast reaction via WebSocket
+	go s.broadcastReaction(chatID, messageID, userID, reactionType, "added")
+
+	return reactionResponse, nil
+}
+
+// RemoveReaction removes a user's reaction from a message
+func (s *ChatService) RemoveReaction(userID uuid.UUID, messageID uuid.UUID, chatID uuid.UUID, reactionType string) (*ReactionResponse, error) {
+	// Verify user has access to this chat
+	isMember, err := s.isUserChatMember(userID, chatID)
+	if err != nil || !isMember {
+		return nil, errors.New("access denied")
+	}
+
+	// Remove reaction
+	query := `DELETE FROM message_reactions WHERE message_id = $1 AND user_id = $2 AND reaction_type = $3`
+	result, err := s.db.Exec(query, messageID, userID, reactionType)
+	if err != nil {
+		return nil, err
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		return nil, errors.New("reaction not found")
+	}
+
+	// Get updated reaction summary
+	reactionResponse, err := s.GetMessageReactions(messageID, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Broadcast reaction removal via WebSocket
+	go s.broadcastReaction(chatID, messageID, userID, reactionType, "removed")
+
+	return reactionResponse, nil
+}
+
+// GetMessageReactions gets all reactions for a message
+func (s *ChatService) GetMessageReactions(messageID uuid.UUID, currentUserID uuid.UUID) (*ReactionResponse, error) {
+	query := `
+		SELECT 
+			mr.reaction_type,
+			COUNT(*) as count,
+			ARRAY_AGG(
+				JSON_BUILD_OBJECT(
+					'user_id', u.id,
+					'username', u.username,
+					'first_name', u.first_name
+				)
+			) as users,
+			BOOL_OR(mr.user_id = $2) as has_reacted
+		FROM message_reactions mr
+		JOIN users u ON mr.user_id = u.id
+		WHERE mr.message_id = $1
+		GROUP BY mr.reaction_type
+		ORDER BY count DESC, mr.reaction_type`
+
+	rows, err := s.db.Query(query, messageID, currentUserID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var reactions []ReactionSummary
+	totalCount := 0
+
+	for rows.Next() {
+		var reaction ReactionSummary
+		var usersJSON string
+		var count int
+
+		err := rows.Scan(&reaction.ReactionType, &count, &usersJSON, &reaction.HasReacted)
+		if err != nil {
+			continue
+		}
+
+		reaction.Count = count
+		totalCount += count
+
+		// Parse users JSON
+		var users []ReactionUser
+		if err := json.Unmarshal([]byte(usersJSON), &users); err == nil {
+			reaction.Users = users
+		}
+
+		reactions = append(reactions, reaction)
+	}
+
+	return &ReactionResponse{
+		MessageID:  messageID,
+		Reactions:  reactions,
+		TotalCount: totalCount,
+	}, nil
+}
+
+func (s *ChatService) broadcastReaction(chatID uuid.UUID, messageID uuid.UUID, userID uuid.UUID, reactionType string, action string) {
+	if s.wsHub == nil {
+		return // No WebSocket hub available
+	}
+
+	// Get user info for the broadcast
+	userInfo, err := s.getUserInfo(userID)
+	if err != nil {
+		return
+	}
+
+	// Create WebSocket message
+	wsMessage := WSMessage{
+		Type:      "message_reaction",
+		ChatID:    chatID,
+		UserID:    userID,
+		MessageID: messageID,
+		Content: map[string]interface{}{
+			"message_id":    messageID,
+			"user_id":       userID,
+			"username":      userInfo.Username,
+			"first_name":    userInfo.FirstName,
+			"reaction_type": reactionType,
+			"action":        action, // "added" or "removed"
+		},
+		Timestamp: time.Now(),
+	}
+
+	// Broadcast to all users in the chat
+	s.wsHub.broadcast <- wsMessage
+}
+
+// Add these methods to your existing ChatService in internal/chat/service.go
+
+// ForwardMessages forwards one or more messages to one or more chats
+func (s *ChatService) ForwardMessages(userID uuid.UUID, req *ForwardMessageRequest) (*ForwardResponse, error) {
+	if len(req.MessageIDs) > 10 {
+		return nil, errors.New("cannot forward more than 10 messages at once")
+	}
+
+	if len(req.ToChatIDs) > 5 {
+		return nil, errors.New("cannot forward to more than 5 chats at once")
+	}
+
+	var forwardedMessages []ForwardedMessage
+	var failedForwards []FailedForward
+
+	// Process each message to each chat
+	for _, messageID := range req.MessageIDs {
+		for _, toChatID := range req.ToChatIDs {
+			forwarded, err := s.forwardSingleMessage(userID, messageID, toChatID, req.Caption)
+			if err != nil {
+				failedForwards = append(failedForwards, FailedForward{
+					MessageID: messageID,
+					ChatID:    toChatID,
+					Error:     err.Error(),
+				})
+				continue
+			}
+			forwardedMessages = append(forwardedMessages, *forwarded)
+		}
+	}
+
+	return &ForwardResponse{
+		ForwardedCount:    len(forwardedMessages),
+		ForwardedMessages: forwardedMessages,
+		FailedForwards:    failedForwards,
+	}, nil
+}
+
+// forwardSingleMessage forwards a single message to a single chat
+func (s *ChatService) forwardSingleMessage(userID uuid.UUID, messageID uuid.UUID, toChatID uuid.UUID, caption string) (*ForwardedMessage, error) {
+	// 1. Verify user can access the original message
+	originalMessage, err := s.getMessageForForwarding(userID, messageID)
+	if err != nil {
+		return nil, fmt.Errorf("cannot access original message: %v", err)
+	}
+
+	// 2. Verify user can send to target chat
+	canSend, err := s.canUserSendMessage(userID, toChatID)
+	if err != nil || !canSend {
+		return nil, errors.New("cannot send to target chat")
+	}
+
+	// 3. Check forward chain depth (prevent infinite forwarding)
+	depth := s.getForwardChainDepth(messageID)
+	if depth > 5 {
+		return nil, errors.New("message has been forwarded too many times")
+	}
+
+	// 4. Create the forwarded message
+	newMessageID := uuid.New()
+	now := time.Now()
+
+	// Determine forward source (if already forwarded, use original source)
+	var forwardFromUserID, forwardFromChatID, forwardFromMessageID *uuid.UUID
+	var forwardDate *time.Time
+
+	if originalMessage.ForwardFromMessageID != nil {
+		// Already a forward, maintain original source
+		forwardFromUserID = originalMessage.ForwardFromUserID
+		forwardFromChatID = originalMessage.ForwardFromChatID
+		forwardFromMessageID = originalMessage.ForwardFromMessageID
+		forwardDate = originalMessage.ForwardDate
+	} else {
+		// First forward, set current message as source
+		forwardFromUserID = &originalMessage.SenderID
+		forwardFromChatID = &originalMessage.ChatID
+		forwardFromMessageID = &messageID
+		forwardDate = &originalMessage.CreatedAt
+	}
+
+	// 5. Insert forwarded message
+	insertQuery := `
+		INSERT INTO messages (
+			id, chat_id, sender_id, message_type, content, caption,
+			forward_from_user_id, forward_from_chat_id, forward_from_message_id, forward_date,
+			file_id, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`
+
+	messageCaption := caption
+	if messageCaption == "" && originalMessage.MessageType != "text" {
+		messageCaption = originalMessage.Content // Use original caption for media
+	}
+
+	_, err = s.db.Exec(insertQuery,
+		newMessageID, toChatID, userID, originalMessage.MessageType, originalMessage.Content, messageCaption,
+		forwardFromUserID, forwardFromChatID, forwardFromMessageID, forwardDate,
+		originalMessage.FileID, now,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create forwarded message: %v", err)
+	}
+
+	// 6. Track the forward relationship
+	trackQuery := `
+		INSERT INTO message_forwards (original_message_id, forwarded_message_id, forwarded_by, forwarded_to_chat_id)
+		VALUES ($1, $2, $3, $4)`
+	_, err = s.db.Exec(trackQuery, messageID, newMessageID, userID, toChatID)
+	if err != nil {
+		// Not critical if tracking fails
+		log.Printf("Failed to track forward: %v", err)
+	}
+
+	// 7. Update chat timestamp
+	s.updateChatTimestamp(toChatID)
+
+	// 8. Get original sender and chat info for response
+	originalSender, originalChatTitle := s.getForwardSourceInfo(forwardFromUserID, forwardFromChatID)
+
+	// 9. Broadcast via WebSocket
+	if s.wsHub != nil {
+		go s.broadcastForwardedMessage(toChatID, newMessageID, userID, originalMessage)
+	}
+
+	return &ForwardedMessage{
+		ID:                newMessageID,
+		OriginalMessageID: messageID,
+		ForwardedToChatID: toChatID,
+		ForwardedBy:       userID,
+		ForwardedAt:       now,
+		OriginalSender:    originalSender,
+		OriginalChatTitle: originalChatTitle,
+		OriginalContent:   originalMessage.Content,
+		OriginalCreatedAt: originalMessage.CreatedAt,
+	}, nil
+}
+
+// Helper functions for forwarding
+
+func (s *ChatService) getMessageForForwarding(userID uuid.UUID, messageID uuid.UUID) (*Message, error) {
+	// Check if user has access to this message (is member of the chat)
+	query := `
+		SELECT m.id, m.chat_id, m.sender_id, m.message_type, m.content, m.file_id, m.created_at,
+		       m.forward_from_user_id, m.forward_from_chat_id, m.forward_from_message_id, m.forward_date
+		FROM messages m
+		JOIN chat_members cm ON m.chat_id = cm.chat_id
+		WHERE m.id = $1 AND cm.user_id = $2 AND cm.status = 'active' AND m.is_deleted = false`
+
+	var msg Message
+	var forwardFromUserID, forwardFromChatID, forwardFromMessageID sql.NullString
+	var forwardDate sql.NullTime
+
+	err := s.db.QueryRow(query, messageID, userID).Scan(
+		&msg.ID, &msg.ChatID, &msg.SenderID, &msg.MessageType, &msg.Content, &msg.FileID, &msg.CreatedAt,
+		&forwardFromUserID, &forwardFromChatID, &forwardFromMessageID, &forwardDate,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse forward info if present
+	if forwardFromUserID.Valid {
+		if id, err := uuid.Parse(forwardFromUserID.String); err == nil {
+			msg.ForwardFromUserID = &id
+		}
+	}
+	if forwardFromChatID.Valid {
+		if id, err := uuid.Parse(forwardFromChatID.String); err == nil {
+			msg.ForwardFromChatID = &id
+		}
+	}
+	if forwardFromMessageID.Valid {
+		if id, err := uuid.Parse(forwardFromMessageID.String); err == nil {
+			msg.ForwardFromMessageID = &id
+		}
+	}
+	if forwardDate.Valid {
+		msg.ForwardDate = &forwardDate.Time
+	}
+
+	return &msg, nil
+}
+
+func (s *ChatService) getForwardChainDepth(messageID uuid.UUID) int {
+	var depth int
+	query := `SELECT get_forward_chain_depth($1)`
+	s.db.QueryRow(query, messageID).Scan(&depth)
+	return depth
+}
+
+func (s *ChatService) getForwardSourceInfo(userID *uuid.UUID, chatID *uuid.UUID) (string, string) {
+	var senderName, chatTitle string
+
+	if userID != nil {
+		userQuery := `SELECT CONCAT(first_name, ' ', last_name) FROM users WHERE id = $1`
+		s.db.QueryRow(userQuery, *userID).Scan(&senderName)
+	}
+
+	if chatID != nil {
+		chatQuery := `SELECT COALESCE(title, 'Private Chat') FROM chats WHERE id = $1`
+		s.db.QueryRow(chatQuery, *chatID).Scan(&chatTitle)
+	}
+
+	return senderName, chatTitle
+}
+
+func (s *ChatService) broadcastForwardedMessage(chatID uuid.UUID, messageID uuid.UUID, userID uuid.UUID, originalMessage *Message) {
+	if s.wsHub == nil {
+		return
+	}
+
+	// Create WebSocket message for forwarded message
+	wsMessage := WSMessage{
+		Type:      WSMessageReceived,
+		ChatID:    chatID,
+		UserID:    userID,
+		MessageID: messageID,
+		Content: map[string]interface{}{
+			"message_id":   messageID,
+			"message_type": originalMessage.MessageType,
+			"content":      originalMessage.Content,
+			"is_forwarded": true,
+			"forwarded_by": userID,
+		},
+		Timestamp: time.Now(),
+	}
+
+	s.wsHub.broadcast <- wsMessage
 }

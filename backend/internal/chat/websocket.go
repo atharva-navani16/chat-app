@@ -180,33 +180,37 @@ func (h *WSHub) unregisterClient(client *WSClient) {
 	log.Printf("❌ Client disconnected: %s (User: %s)", client.ID, client.Username)
 }
 
-// broadcastMessage sends a message to all relevant clients
+// Update the broadcastMessage function in websocket.go to handle reactions:
 func (h *WSHub) broadcastMessage(message WSMessage) {
 	h.mutex.RLock()
 	defer h.mutex.RUnlock()
-
+	
 	switch message.Type {
-	case WSMessageReceived:
+	case WSMessageReceived, WSMessageReaction:  // Add WSMessageReaction here
 		// Send to all clients in the chat
 		if chatUsers, exists := h.chatRooms[message.ChatID]; exists {
 			for userID, userClients := range chatUsers {
-				if userID != message.UserID { // Don't send to sender
-					for _, client := range userClients {
-						select {
-						case client.Send <- message:
-						default:
-							// Client's send channel is full, disconnect
-							h.unregister <- client
-						}
+				// For reactions, send to everyone including sender (they need confirmation)
+				// For messages, don't send to sender
+				if message.Type == WSMessageReceived && userID == message.UserID {
+					continue // Don't send message back to sender
+				}
+				
+				for _, client := range userClients {
+					select {
+					case client.Send <- message:
+					default:
+						// Client's send channel is full, disconnect
+						h.unregister <- client
 					}
 				}
 			}
 		}
-
+		
 	case WSUserOnline, WSUserOffline:
 		// Send to all contacts of the user
 		h.broadcastToUserContacts(message.UserID, message)
-
+		
 	case WSTypingStart, WSTypingStop:
 		// Send to other users in the chat
 		if chatUsers, exists := h.chatRooms[message.ChatID]; exists {

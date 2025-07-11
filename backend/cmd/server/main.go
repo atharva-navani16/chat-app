@@ -7,11 +7,12 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/gin-gonic/gin"
 	"github.com/atharva-navani16/chat-app.git/internal/auth"
 	"github.com/atharva-navani16/chat-app.git/internal/chat"
 	"github.com/atharva-navani16/chat-app.git/internal/config"
+	"github.com/atharva-navani16/chat-app.git/internal/file"
 	"github.com/atharva-navani16/chat-app.git/internal/shared/database"
+	"github.com/gin-gonic/gin"
 )
 
 func main() {
@@ -36,18 +37,23 @@ func main() {
 		c.Header("Access-Control-Allow-Origin", "*")
 		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		c.Header("Access-Control-Allow-Headers", "Origin, Content-Type, Authorization")
-		
+
 		if c.Request.Method == "OPTIONS" {
 			c.AbortWithStatus(204)
 			return
 		}
-		
+
 		c.Next()
 	})
 
 	// Initialize services
+
+	// Initialize WebSocket hub
+	wsHub := chat.NewWSHub(rdb)
+	go wsHub.Run()
+
 	authService := auth.NewAuthService(db, rdb, cfg)
-	chatService := chat.NewChatService(db, rdb, cfg)
+	chatService := chat.NewChatService(db, rdb, cfg, wsHub)
 
 	// Initialize handlers
 	authHandler := auth.NewAuthHandler(authService)
@@ -56,9 +62,13 @@ func main() {
 	// Initialize JWT middleware
 	jwtMiddleware := auth.NewJWTMiddleware(cfg, db)
 
-	// Initialize WebSocket hub
-	wsHub := chat.NewWSHub(rdb)
-	go wsHub.Run()
+	fileService, err := file.NewFileService(db, cfg)
+	if err != nil {
+		log.Fatal("Failed to initialize file service:", err)
+	}
+
+	// Initialize file handler
+	fileHandler := file.NewFileHandler(fileService)
 
 	// Start Redis subscriber for cross-server communication
 	ctx := context.Background()
@@ -67,7 +77,7 @@ func main() {
 	// Health check endpoint
 	router.GET("/health", func(c *gin.Context) {
 		connectionCount := wsHub.GetConnectionCount()
-		
+
 		if err := db.Ping(); err != nil {
 			c.JSON(500, gin.H{"error": "Database not healthy"})
 			return
@@ -76,12 +86,12 @@ func main() {
 			c.JSON(500, gin.H{"error": "Redis not healthy"})
 			return
 		}
-		
+
 		c.JSON(200, gin.H{
-			"message": "healthy",
-			"timestamp": "2025-07-08",
+			"message":               "healthy",
+			"timestamp":             "2025-07-08",
 			"websocket_connections": connectionCount,
-			"version": "1.0.0",
+			"version":               "1.0.0",
 		})
 	})
 
@@ -101,33 +111,50 @@ func main() {
 		{
 			userRoutes.GET("/me", getUserProfile)
 			userRoutes.PUT("/me", updateUserProfile)
-			userRoutes.GET("/search", searchUsers)
+			userRoutes.GET("/search", authHandler.SearchUsers) // Search users
 		}
 
 		// Protected chat routes (authentication required)
+
+		fileRoutes := api.Group("/files")
+		fileRoutes.Use(jwtMiddleware.AuthRequired())
+		{
+			fileRoutes.POST("/upload", fileHandler.UploadFile)
+			fileRoutes.GET("/:file_id", fileHandler.GetFile)
+			fileRoutes.GET("/:file_id/download", fileHandler.DownloadFile)
+			fileRoutes.DELETE("/:file_id", fileHandler.DeleteFile)
+		}
 		chatRoutes := api.Group("/chats")
 		chatRoutes.Use(jwtMiddleware.AuthRequired())
 		{
 			// Chat management
-			chatRoutes.GET("", chatHandler.GetUserChats)                    // Get user's chats
-			chatRoutes.POST("/private", chatHandler.CreatePrivateChat)      // Create private chat
-			chatRoutes.POST("/group", chatHandler.CreateGroupChat)          // Create group chat
-			chatRoutes.GET("/:chat_id", chatHandler.GetChatDetails)         // Get chat details
-			chatRoutes.PUT("/:chat_id", chatHandler.UpdateChat)             // Update chat
-			chatRoutes.POST("/:chat_id/leave", chatHandler.LeaveChat)       // Leave chat
-			
+			chatRoutes.GET("", chatHandler.GetUserChats)               // Get user's chats
+			chatRoutes.POST("/private", chatHandler.CreatePrivateChat) // Create private chat
+			chatRoutes.POST("/group", chatHandler.CreateGroupChat)     // Create group chat
+			chatRoutes.GET("/:chat_id", chatHandler.GetChatDetails)    // Get chat details
+			chatRoutes.PUT("/:chat_id", chatHandler.UpdateChat)        // Update chat
+			chatRoutes.POST("/:chat_id/leave", chatHandler.LeaveChat)  // Leave chat
+
 			// Message management
-			chatRoutes.GET("/:chat_id/messages", chatHandler.GetMessages)                     // Get messages
-			chatRoutes.POST("/:chat_id/messages", chatHandler.SendMessage)                    // Send message
+			chatRoutes.GET("/:chat_id/messages", chatHandler.GetMessages)                         // Get messages
+			chatRoutes.POST("/:chat_id/messages", chatHandler.SendMessage)                        // Send message
 			chatRoutes.POST("/:chat_id/messages/:message_id/read", chatHandler.MarkMessageAsRead) // Mark as read
-			
+
 			// Member management
-			chatRoutes.GET("/:chat_id/members", chatHandler.GetChatMembers)          // Get members
-			chatRoutes.POST("/:chat_id/members", chatHandler.AddMembersToGroup)      // Add members
+			chatRoutes.GET("/:chat_id/members", chatHandler.GetChatMembers)                    // Get members
+			chatRoutes.POST("/:chat_id/members", chatHandler.AddMembersToGroup)                // Add members
 			chatRoutes.DELETE("/:chat_id/members/:user_id", chatHandler.RemoveMemberFromGroup) // Remove member
-			
+
 			// Search
 			chatRoutes.GET("/search", chatHandler.SearchChats) // Search chats
+
+			// Reactions
+			chatRoutes.POST("/:chat_id/messages/:message_id/reactions", chatHandler.AddReaction)
+			chatRoutes.DELETE("/:chat_id/messages/:message_id/reactions/:reaction_type", chatHandler.RemoveReaction)
+			chatRoutes.GET("/:chat_id/messages/:message_id/reactions", chatHandler.GetMessageReactions)
+
+			// Forward messages
+			chatRoutes.POST("/forward", chatHandler.ForwardMessages)
 		}
 
 		// WebSocket endpoint (authentication required)
@@ -193,7 +220,7 @@ func main() {
 	fmt.Printf("🌐 API Base URL: http://localhost:%s/api/v1\n", cfg.ServerPort)
 	fmt.Println("📡 ═══════════════════════════════════════════════════")
 	fmt.Println("")
-	
+
 	router.Run(serverAddr)
 }
 
@@ -211,11 +238,11 @@ func getUserProfile(c *gin.Context) {
 		"data": gin.H{
 			"user": user,
 			"features": gin.H{
-				"messaging": true,
+				"messaging":    true,
 				"file_sharing": false, // Coming soon
-				"voice_calls": false,  // Coming soon
-				"video_calls": false,  // Coming soon
-				"encryption": true,
+				"voice_calls":  false, // Coming soon
+				"video_calls":  false, // Coming soon
+				"encryption":   true,
 			},
 		},
 	})
@@ -248,38 +275,11 @@ func updateUserProfile(c *gin.Context) {
 	})
 }
 
-func searchUsers(c *gin.Context) {
-	user, exists := auth.RequireUser(c)
-	if !exists {
-		return
-	}
-
-	query := c.Query("q")
-	if query == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Search query required"})
-		return
-	}
-
-	searchType := c.DefaultQuery("type", "username") // username, name, phone
-
-	// TODO: Implement actual search logic in user service
-	c.JSON(http.StatusOK, gin.H{
-		"message": "Search completed",
-		"data": gin.H{
-			"query":       query,
-			"type":        searchType,
-			"searched_by": user.Username,
-			"results":     []interface{}{}, // Empty for now
-			"total":       0,
-		},
-	})
-}
-
 func getPublicUserProfile(c *gin.Context) {
 	username := c.Param("username")
-	
+
 	currentUser, isAuthenticated := auth.GetCurrentUser(c)
-	
+
 	// TODO: Implement logic to get public profile from database
 	response := gin.H{
 		"message": "Public profile retrieved",
@@ -291,10 +291,10 @@ func getPublicUserProfile(c *gin.Context) {
 		},
 		"viewer_authenticated": isAuthenticated,
 	}
-	
+
 	if isAuthenticated {
 		response["viewer"] = currentUser.Username
 	}
-	
+
 	c.JSON(http.StatusOK, response)
 }

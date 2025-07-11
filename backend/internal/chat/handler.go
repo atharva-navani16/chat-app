@@ -1,6 +1,7 @@
 package chat
 
 import (
+	"fmt"
 	"net/http"
 	"strconv"
 
@@ -473,5 +474,211 @@ func (h *ChatHandler) SearchChats(c *gin.Context) {
 		"query":       query,
 		"searched_by": user.Username,
 		"results":     []interface{}{},
+	})
+}
+
+// Add these methods to your existing ChatHandler in internal/chat/handler.go
+
+// AddReaction adds a reaction to a message
+// POST /api/v1/chats/:chat_id/messages/:message_id/reactions
+func (h *ChatHandler) AddReaction(c *gin.Context) {
+	user, exists := auth.RequireUser(c)
+	if !exists {
+		return
+	}
+
+	chatIDStr := c.Param("chat_id")
+	chatID, err := uuid.Parse(chatIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid chat ID"})
+		return
+	}
+
+	messageIDStr := c.Param("message_id")
+	messageID, err := uuid.Parse(messageIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid message ID"})
+		return
+	}
+
+	var req AddReactionRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "Invalid request data",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	// Validate reaction type
+	validReactions := []string{"👍", "👎", "❤️", "😂", "😮", "😢", "😡", "🔥", "👏", "🎉"}
+	isValid := false
+	for _, valid := range validReactions {
+		if req.ReactionType == valid {
+			isValid = true
+			break
+		}
+	}
+	if !isValid {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":           "Invalid reaction type",
+			"valid_reactions": validReactions,
+		})
+		return
+	}
+
+	reactionResponse, err := h.chatService.AddReaction(user.Id, messageID, chatID, req.ReactionType)
+	if err != nil {
+		statusCode := http.StatusInternalServerError
+		if err.Error() == "access denied" {
+			statusCode = http.StatusForbidden
+		}
+		c.JSON(statusCode, gin.H{
+			"error":   "Failed to add reaction",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Reaction added successfully",
+		"data":    reactionResponse,
+	})
+}
+
+// RemoveReaction removes a reaction from a message
+// DELETE /api/v1/chats/:chat_id/messages/:message_id/reactions/:reaction_type
+func (h *ChatHandler) RemoveReaction(c *gin.Context) {
+	user, exists := auth.RequireUser(c)
+	if !exists {
+		return
+	}
+
+	chatIDStr := c.Param("chat_id")
+	chatID, err := uuid.Parse(chatIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid chat ID"})
+		return
+	}
+
+	messageIDStr := c.Param("message_id")
+	messageID, err := uuid.Parse(messageIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid message ID"})
+		return
+	}
+
+	reactionType := c.Param("reaction_type")
+	if reactionType == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Reaction type required"})
+		return
+	}
+
+	reactionResponse, err := h.chatService.RemoveReaction(user.Id, messageID, chatID, reactionType)
+	if err != nil {
+		statusCode := http.StatusInternalServerError
+		if err.Error() == "access denied" {
+			statusCode = http.StatusForbidden
+		} else if err.Error() == "reaction not found" {
+			statusCode = http.StatusNotFound
+		}
+		c.JSON(statusCode, gin.H{
+			"error":   "Failed to remove reaction",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Reaction removed successfully",
+		"data":    reactionResponse,
+	})
+}
+
+func (h *ChatHandler) GetMessageReactions(c *gin.Context) {
+	user, exists := auth.RequireUser(c)
+	if !exists {
+		return
+	}
+
+	messageIDStr := c.Param("message_id")
+	messageID, err := uuid.Parse(messageIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid message ID"})
+		return
+	}
+
+	reactionResponse, err := h.chatService.GetMessageReactions(messageID, user.Id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "Failed to get reactions",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Reactions retrieved successfully",
+		"data":    reactionResponse,
+	})
+}
+
+// Add this method to your existing ChatHandler in internal/chat/handler.go
+
+// ForwardMessages forwards messages to other chats
+// POST /api/v1/chats/forward
+func (h *ChatHandler) ForwardMessages(c *gin.Context) {
+	user, exists := auth.RequireUser(c)
+	if !exists {
+		return
+	}
+
+	var req ForwardMessageRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "Invalid request data",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	// Validate limits
+	if len(req.MessageIDs) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "At least one message ID required",
+		})
+		return
+	}
+
+	if len(req.ToChatIDs) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "At least one target chat ID required",
+		})
+		return
+	}
+
+	forwardResponse, err := h.chatService.ForwardMessages(user.Id, &req)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "Failed to forward messages",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	// Determine response status
+	statusCode := http.StatusOK
+	if forwardResponse.ForwardedCount == 0 {
+		statusCode = http.StatusBadRequest
+	} else if len(forwardResponse.FailedForwards) > 0 {
+		statusCode = http.StatusPartialContent // 206 - some succeeded, some failed
+	}
+
+	c.JSON(statusCode, gin.H{
+		"message": fmt.Sprintf("Forwarded %d of %d messages to %d chats",
+			forwardResponse.ForwardedCount,
+			len(req.MessageIDs)*len(req.ToChatIDs),
+			len(req.ToChatIDs)),
+		"data": forwardResponse,
 	})
 }

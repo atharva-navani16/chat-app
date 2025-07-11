@@ -66,3 +66,14 @@ type AuthResponse struct {
 	ExpiresAt    time.Time   `json:"expires_at"`
 	User         UserResponse `json:"user"`
 }
+
+type UserSearchResult struct {
+	ID             uuid.UUID  `json:"id"`
+	Username       string     `json:"username"`
+	FirstName      string     `json:"first_name"`
+	LastName       string     `json:"last_name"`
+	PhoneNumber    string     `json:"phone_number,omitempty"`
+	Bio            string     `json:"bio,omitempty"`
+	IsPublic       bool       `json:"is_public"`
+	ExistingChatID *uuid.UUID `json:"existing_chat_id,omitempty"`
+}

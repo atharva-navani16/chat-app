@@ -55,10 +55,20 @@ type Message struct {
 	CreatedAt        time.Time  `json:"created_at" db:"created_at"`
 	EditedAt         *time.Time `json:"edited_at,omitempty" db:"edited_at"`
 
+	Reactions []ReactionSummary `json:"reactions,omitempty"`
+
 	// Additional fields for response
 	SenderUsername string   `json:"sender_username,omitempty"`
 	SenderName     string   `json:"sender_name,omitempty"`
 	ReplyToMessage *Message `json:"reply_to_message,omitempty"`
+
+	// forwards
+	ForwardFromUserID    *uuid.UUID `json:"forward_from_user_id,omitempty" db:"forward_from_user_id"`
+	ForwardFromChatID    *uuid.UUID `json:"forward_from_chat_id,omitempty" db:"forward_from_chat_id"`
+	ForwardFromMessageID *uuid.UUID `json:"forward_from_message_id,omitempty" db:"forward_from_message_id"`
+	ForwardDate          *time.Time `json:"forward_date,omitempty" db:"forward_date"`
+	ForwardSenderName    string     `json:"forward_sender_name,omitempty"`
+	ForwardChatTitle     string     `json:"forward_chat_title,omitempty"`
 }
 
 // Request/Response structs
@@ -128,6 +138,7 @@ const (
 	WSUserOnline      WSMessageType = "user_online"
 	WSUserOffline     WSMessageType = "user_offline"
 	WSMessageRead     WSMessageType = "message_read"
+	WSMessageReaction WSMessageType = "message_reaction"
 )
 
 // WSMessage represents WebSocket messages
@@ -138,4 +149,76 @@ type WSMessage struct {
 	MessageID uuid.UUID     `json:"message_id,omitempty"`
 	Content   interface{}   `json:"content,omitempty"`
 	Timestamp time.Time     `json:"timestamp"`
+}
+type MessageReaction struct {
+	MessageID    uuid.UUID `json:"message_id" db:"message_id"`
+	UserID       uuid.UUID `json:"user_id" db:"user_id"`
+	ReactionType string    `json:"reaction_type" db:"reaction_type"`
+	CreatedAt    time.Time `json:"created_at" db:"created_at"`
+
+	// User info for response
+	Username  string `json:"username,omitempty"`
+	FirstName string `json:"first_name,omitempty"`
+}
+
+type ReactionSummary struct {
+	ReactionType string         `json:"reaction_type"`
+	Count        int            `json:"count"`
+	Users        []ReactionUser `json:"users"`
+	HasReacted   bool           `json:"has_reacted"` // If current user reacted
+}
+
+type ReactionUser struct {
+	UserID    uuid.UUID `json:"user_id"`
+	Username  string    `json:"username"`
+	FirstName string    `json:"first_name"`
+}
+
+type AddReactionRequest struct {
+	ReactionType string `json:"reaction_type" binding:"required"`
+}
+
+// ReactionResponse for API responses
+type ReactionResponse struct {
+	MessageID  uuid.UUID         `json:"message_id"`
+	Reactions  []ReactionSummary `json:"reactions"`
+	TotalCount int               `json:"total_count"`
+}
+
+// Add these to your existing internal/chat/models.go
+
+// ForwardMessageRequest for forwarding messages
+type ForwardMessageRequest struct {
+	MessageIDs []uuid.UUID `json:"message_ids" binding:"required,min=1,max=10"`
+	ToChatIDs  []uuid.UUID `json:"to_chat_ids" binding:"required,min=1,max=5"`
+	Caption    string      `json:"caption,omitempty"` // Optional caption when forwarding
+}
+
+// ForwardedMessage represents a forwarded message details
+type ForwardedMessage struct {
+	ID                uuid.UUID `json:"id"`
+	OriginalMessageID uuid.UUID `json:"original_message_id"`
+	ForwardedToChatID uuid.UUID `json:"forwarded_to_chat_id"`
+	ForwardedBy       uuid.UUID `json:"forwarded_by"`
+	ForwardedAt       time.Time `json:"forwarded_at"`
+
+	// Original message details
+	OriginalSender    string    `json:"original_sender,omitempty"`
+	OriginalChatTitle string    `json:"original_chat_title,omitempty"`
+	OriginalContent   string    `json:"original_content,omitempty"`
+	OriginalCreatedAt time.Time `json:"original_created_at,omitempty"`
+}
+
+// ForwardResponse for API responses
+type ForwardResponse struct {
+	ForwardedCount    int                `json:"forwarded_count"`
+	ForwardedMessages []ForwardedMessage `json:"forwarded_messages"`
+	FailedForwards    []FailedForward    `json:"failed_forwards,omitempty"`
+}
+
+// FailedForward represents failed forwarding attempts
+type FailedForward struct {
+	MessageID uuid.UUID `json:"message_id"`
+	ChatID    uuid.UUID `json:"chat_id"`
+	Error     string    `json:"error"`
 }

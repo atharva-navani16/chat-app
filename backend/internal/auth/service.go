@@ -4,6 +4,8 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/atharva-navani16/chat-app.git/internal/config"
@@ -156,7 +158,7 @@ func (s *AuthService) generateJWT(userID uuid.UUID) (string, time.Time, error) {
 	// Create the claims (data inside the token)
 	claims := jwt.MapClaims{
 		"user_id": userID.String(),
-		"exp":     expiresAt.Unix(), // Expiration time
+		"exp":     expiresAt.Unix(),  // Expiration time
 		"iat":     time.Now().Unix(), // Issued at time
 	}
 
@@ -215,4 +217,118 @@ func (s *AuthService) findUserByCredentials(req *LoginRequest) (*Users, error) {
 	}
 
 	return &user, nil
+}
+
+// Fixed version with better debugging
+func (s *AuthService) SearchUsers(query string, searchType string, currentUserID uuid.UUID) ([]UserSearchResult, error) {
+	fmt.Printf("🔍 Search Debug: query='%s', type='%s', userID='%s'\n", query, searchType, currentUserID)
+
+	var sqlQuery string
+	var args []interface{}
+
+	// Convert searchType to lowercase for consistency
+	searchType = strings.ToLower(searchType)
+
+	switch searchType {
+	case "username":
+		sqlQuery = `
+			SELECT id, username, first_name, last_name, phone_number, bio, is_public
+			FROM users 
+			WHERE username ILIKE $1 AND id != $2
+			ORDER BY username
+			LIMIT 20`
+		args = []interface{}{"%" + query + "%", currentUserID}
+
+	case "phone":
+		sqlQuery = `
+			SELECT id, username, first_name, last_name, phone_number, bio, is_public
+			FROM users 
+			WHERE phone_number = $1 AND id != $2 AND allow_phone_discovery = true
+			LIMIT 1`
+		args = []interface{}{query, currentUserID}
+
+	case "name":
+		sqlQuery = `
+			SELECT id, username, first_name, last_name, phone_number, bio, is_public
+			FROM users 
+			WHERE (first_name ILIKE $1 OR last_name ILIKE $1) 
+			AND id != $2 AND is_public = true
+			ORDER BY first_name, last_name
+			LIMIT 20`
+		args = []interface{}{"%" + query + "%", currentUserID}
+
+	default:
+		// Global search - search everything
+		sqlQuery = `
+			SELECT id, username, first_name, last_name, phone_number, bio, is_public
+			FROM users 
+			WHERE (username ILIKE $1 OR first_name ILIKE $1 OR last_name ILIKE $1)
+			AND id != $2
+			ORDER BY username, first_name
+			LIMIT 20`
+		args = []interface{}{"%" + query + "%", currentUserID}
+	}
+
+	fmt.Printf("🔍 SQL Query: %s\n", sqlQuery)
+	fmt.Printf("🔍 Args: %v\n", args)
+
+	rows, err := s.db.Query(sqlQuery, args...)
+	if err != nil {
+		fmt.Printf("❌ Query error: %v\n", err)
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []UserSearchResult
+	for rows.Next() {
+		var user UserSearchResult
+		var phoneNumber sql.NullString
+		var bio sql.NullString
+
+		err := rows.Scan(
+			&user.ID, &user.Username, &user.FirstName, &user.LastName,
+			&phoneNumber, &bio, &user.IsPublic,
+		)
+		if err != nil {
+			fmt.Printf("❌ Scan error: %v\n", err)
+			continue
+		}
+
+		if phoneNumber.Valid {
+			user.PhoneNumber = phoneNumber.String
+		}
+
+		if bio.Valid {
+			user.Bio = bio.String
+		}
+
+		results = append(results, user)
+		fmt.Printf("✅ Found user: %s (%s %s)\n", user.Username, user.FirstName, user.LastName)
+	}
+
+	fmt.Printf("🔍 Total results: %d\n", len(results))
+	return results, nil
+}
+
+// Helper functions
+func (s *AuthService) areUsersContacts(userID1, userID2 uuid.UUID) bool {
+	query := `SELECT 1 FROM user_contacts WHERE user_id = $1 AND contact_user_id = $2`
+	var exists int
+	err := s.db.QueryRow(query, userID1, userID2).Scan(&exists)
+	return err == nil
+}
+
+func (s *AuthService) findExistingPrivateChat(userID1, userID2 uuid.UUID) (uuid.UUID, bool) {
+	query := `
+		SELECT c.id FROM chats c
+		JOIN chat_members cm1 ON c.id = cm1.chat_id
+		JOIN chat_members cm2 ON c.id = cm2.chat_id
+		WHERE c.type = 'private' 
+		AND cm1.user_id = $1 AND cm1.status = 'active'
+		AND cm2.user_id = $2 AND cm2.status = 'active'
+		LIMIT 1`
+
+	var chatID uuid.UUID
+	err := s.db.QueryRow(query, userID1, userID2).Scan(&chatID)
+	return chatID, err == nil
 }
