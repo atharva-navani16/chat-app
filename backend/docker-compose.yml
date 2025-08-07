@@ -70,35 +70,35 @@ services:
       timeout: 20s
       retries: 3
 
-  # Chat App (uncomment when ready to run your Go app)
-  # chat-app:
-  #   build: .
-  #   container_name: chat_app
-  #   restart: unless-stopped
-  #   ports:
-  #     - "8000:8000"
-  #   environment:
-  #     - DB_HOST=postgres
-  #     - DB_PORT=5432
-  #     - DB_NAME=chatapp
-  #     - DB_USER=chatuser
-  #     - DB_PASSWORD=chatpass123
-  #     - REDIS_HOST=redis
-  #     - REDIS_PORT=6379
-  #     - REDIS_PASSWORD=redispass123
-  #     - JWT_SECRET=your-super-secret-jwt-key-change-this
-  #     - SERVER_PORT=8000
-  #     - MINIO_ENDPOINT=minio:9000
-  #     - MINIO_ACCESS_KEY=minioadmin
-  #     - MINIO_SECRET_KEY=minioadmin123
-  #   depends_on:
-  #     postgres:
-  #       condition: service_healthy
-  #     redis:
-  #       condition: service_healthy
-  #   volumes:
-  #     - .:/app
-  #   working_dir: /app
+  chat-app:
+    build: .
+    container_name: chat_app
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=chatapp
+      - DB_USER=chatuser
+      - DB_PASSWORD=chatpass123
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=redispass123
+      - JWT_SECRET=your-super-secret-jwt-key-change-this
+      - SERVER_PORT=8000
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin123
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - .:/app
+    working_dir: /app
+
 
 volumes:
   postgres_data:
